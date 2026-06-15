@@ -1,0 +1,1 @@
+python -m PyInstaller --onefile --windowed --name "OCRemixJukebox" --icon=icon.ico --collect-all yt_dlp --hidden-import yt_dlp.extractor --hidden-import yt_dlp.downloader --hidden-import vlc --exclude-module tkinter --exclude-module unittest --exclude-module test --exclude-module pydoc ocremix.py
