@@ -182,3 +182,4 @@ cython_debug/
 games_cache.json
 soundcloud_cookies.enc
 soundcloud_cookies_plain.txt
+test.txt
