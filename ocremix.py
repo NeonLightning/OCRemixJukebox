@@ -194,10 +194,18 @@ def load_plain_cookies():
     return plain_cookies_file if os.path.exists(plain_cookies_file) else None
 
 # ---------- Audio player ----------
+class AudioInitializationError(RuntimeError):
+    pass
+
+
 class AudioPlayer:
     def __init__(self):
-        vlc_args = ['--quiet', '--log-verbose=0', '--verbose=-1']
+        vlc_args = ['--quiet', '--verbose=-1']
         self.instance = vlc.Instance(*vlc_args)
+        if self.instance is None:
+            raise AudioInitializationError(
+                "Could not initialize VLC. Check that VLC and its plugins are installed correctly."
+            )
         self.player = self.instance.media_player_new()
         self.current_url = None
         self.length = 0
@@ -1594,10 +1602,18 @@ class OCRemixWindow(QMainWindow):
         if self.current_track:
             QDesktopServices.openUrl(QUrl(self.current_track['url']))
 
-if __name__ == "__main__":
+def main():
     app = QApplication(sys.argv)
     apply_system_theme(app)
     app.setQuitOnLastWindowClosed(False)
-    window = OCRemixWindow()
+    try:
+        window = OCRemixWindow()
+    except AudioInitializationError as error:
+        QMessageBox.critical(None, "Audio Initialization Error", str(error))
+        return 1
     window.show()
-    sys.exit(app.exec_())
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

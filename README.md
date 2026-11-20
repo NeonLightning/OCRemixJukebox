@@ -44,6 +44,9 @@ chmod +x build.sh
 ./build.sh
 ```
 
+The Linux executable uses the system VLC libraries and plugins, which must be installed.
+Rebuild it after changing the source; an existing executable will not update itself.
+
 ## First time usage
 
 - Click **File → Refresh Games** to scrape the full game catalog (takes about a minute). The cache is saved locally.
