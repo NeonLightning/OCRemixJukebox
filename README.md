@@ -14,11 +14,35 @@
 - **SoundCloud cookie support** – Load Netscape‑format cookies to avoid 403/429 errors. Cookies can be stored encrypted (machine‑bound) or as plain text.
 - **System tray** – Minimise to tray with media controls and tooltip showing the current track.
 - **Media keys** – Control playback using keyboard media keys (Play/Pause, Next, Previous).
-- **Dark mode detection** – Automatically switches to a dark theme on Windows when the system is in dark mode.
+- **Dark mode detection** – Automatically switches to a dark theme on Windows and Linux desktop environments.
 
 ## Installation
 
 Install [VLC media player](https://www.videolan.org/vlc/) and ensure `vlc` is in your PATH.
+
+### Linux
+
+Install Qt and VLC with your distribution's package manager, then install the Python dependencies:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+python3 ocremix.py
+```
+
+For Debian/Ubuntu, VLC and Qt system libraries can be installed with:
+
+```bash
+sudo apt install vlc python3-pyqt5
+```
+
+To create a one-file Linux executable:
+
+```bash
+chmod +x build.sh
+./build.sh
+```
 
 ## First time usage
 
