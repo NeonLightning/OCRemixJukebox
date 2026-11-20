@@ -196,7 +196,7 @@ def load_plain_cookies():
 # ---------- Audio player ----------
 class AudioPlayer:
     def __init__(self):
-        vlc_args = ['--quiet', '--log-verbose=0', '--verbose=-1']
+        vlc_args = ['--quiet', '--verbose=-1']
         self.instance = vlc.Instance(*vlc_args)
         self.player = self.instance.media_player_new()
         self.current_url = None
