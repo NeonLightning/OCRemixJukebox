@@ -33,6 +33,10 @@ MANIFEST
 *.spec
 !OCRemixJukebox-linux.spec
 
+# Local browser cookie exports
+cookies.txt
+soundcloud_cookies.txt
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
@@ -184,3 +188,4 @@ games_cache.json
 soundcloud_cookies.enc
 soundcloud_cookies_plain.txt
 test.txt
+cookies.txt

@@ -5,8 +5,9 @@
 ## Features
 
 - **Browse all OCRemix games** – Scrape and cache the full game catalog (thousands of titles).
-- **Add games to your queue** – Load original tracks, remixes, and even external album links (SoundCloud, Bandcamp, YouTube).
-- **Playback control** – Play, pause, next, previous, volume slider, seek bar, and repeat modes (Off / One / All / Sequential).
+- **Browse then queue** – Select a game to browse validated originals, remixes, and external album tracks in the upper pane, then add individual tracks to the queue below.
+- **Playback control** – Play, pause, next, previous, volume (saved between sessions), seek bar, and repeat modes (Off / One / All / Queue).
+- **Reliable loading** – Candidate audio formats are tested before tracks enter the queue; successful stream URLs are briefly cached for playback.
 - **Shuffle modes** – Shuffle the current queue or enable **Global Shuffle** to randomly pick tracks from **all games**.
 - **Save & load queues** – Export your playlist to a JSON file and reload it later. Reload last queue with `Ctrl+Shift+L`.
 - **Auto‑remove invalid tracks** – When a track fails to play, it is automatically deleted from the queue (optional).
@@ -50,9 +51,9 @@ Rebuild it after changing the source; an existing executable will not update its
 ## First time usage
 
 - Click **File → Refresh Games** to scrape the full game catalog (takes about a minute). The cache is saved locally.
-- Search for a game, click its name to add it to the queue.
-- Tracks are loaded incrementally – you'll see progress in the right panel.
-- Click the ▶ button next to any track to start playback.
+- Search for and select a game. Its playable tracks appear in the upper-right pane.
+- Click **+** beside individual tracks to add them to the queue in the lower-right pane.
+- Click the ▶ button next to any track to start playback immediately.
 
 ## Managing SoundCloud cookies
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys, os, re, json, time, threading, random, tempfile, base64, uuid, shutil, subprocess
-from urllib.parse import urljoin, urlencode, unquote
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from urllib.parse import urljoin, urlencode, unquote, urlparse, parse_qs
 from bs4 import BeautifulSoup
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
@@ -15,10 +16,12 @@ try:
 except (ImportError, OSError):
     pynput_keyboard = None
 import requests, yt_dlp, vlc
+from jukebox_audio import AudioInitializationError, AudioPlayer, StreamProxy
+import jukebox_media as media
+from jukebox_widgets import GameWidget, TrackWidget
 
 os.environ['VLC_VERBOSE'] = '-1'
 
-soundcloud_cache = {}
 cookies_path = None
 
 def get_app_data_dir():
@@ -36,6 +39,7 @@ app_data_dir = get_app_data_dir()
 encrypted_cookies_file = os.path.join(app_data_dir, "soundcloud_cookies.enc")
 plain_cookies_file = os.path.join(app_data_dir, "soundcloud_cookies_plain.txt")
 temp_cookies_file = None
+cookie_load_error = None
 
 def migrate_legacy_file(filename, destination):
     if not os.path.exists(destination) and os.path.isfile(filename):
@@ -167,19 +171,23 @@ def encrypt_cookies_auto(plain_path):
         return False
 
 def decrypt_cookies_auto():
+    global temp_cookies_file, cookie_load_error
+    cookie_load_error = None
+    if not os.path.exists(encrypted_cookies_file):
+        return None
     try:
-        if not os.path.exists(encrypted_cookies_file):
-            return None
         with open(encrypted_cookies_file, 'rb') as f:
             encrypted = f.read()
         plain = Fernet(get_machine_key()).decrypt(encrypted)
-        global temp_cookies_file
         temp_cookies_file = tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.txt')
         temp_cookies_file.write(plain)
         temp_cookies_file.close()
         return temp_cookies_file.name
-    except Exception as e:
-        print(f"Auto decryption error: {e}")
+    except Exception as error:
+        detail = str(error).strip()
+        cookie_load_error = "Saved encrypted cookies could not be decrypted on this machine. Re-import them from File → Manage SoundCloud Cookies."
+        if detail:
+            print(f"Encrypted cookie load skipped: {detail}")
         return None
 
 def save_plain_cookies(source_path):
@@ -191,276 +199,81 @@ def save_plain_cookies(source_path):
         return False
 
 def load_plain_cookies():
-    return plain_cookies_file if os.path.exists(plain_cookies_file) else None
+    candidates = (
+        plain_cookies_file,
+        os.path.abspath("soundcloud_cookies.txt"),
+        os.path.abspath("cookies.txt"),
+    )
+    return next((path for path in candidates if os.path.isfile(path)), None)
 
-# ---------- Audio player ----------
-class AudioInitializationError(RuntimeError):
-    pass
-
-
-class AudioPlayer:
-    def __init__(self):
-        vlc_args = ['--quiet', '--verbose=-1']
-        self.instance = vlc.Instance(*vlc_args)
-        if self.instance is None:
-            raise AudioInitializationError(
-                "Could not initialize VLC. Check that VLC and its plugins are installed correctly."
-            )
-        self.player = self.instance.media_player_new()
-        self.current_url = None
-        self.length = 0
-        self.paused = False
-
-    def play_stream(self, url, duration=None):
-        self.stop()
-        self.current_url = url
-        self.length = duration or 0
-        media = self.instance.media_new(url)
-        self.player.set_media(media)
-        self.player.play()
-        self.paused = False
-
-    def pause(self):
-        if self.player.get_state() == vlc.State.Playing:
-            self.player.pause()
-            self.paused = True
-        elif self.paused:
-            self.player.play()
-            self.paused = False
-
-    def stop(self):
-        self.player.stop()
-        self.current_url = None
-        self.paused = False
-        self.length = 0
-
-    def set_volume(self, vol):
-        self.player.audio_set_volume(int(vol))
-
-    def get_pos(self):
-        return self.player.get_time() / 1000.0 if self.player.is_playing() else -1
-
-    def get_length(self):
-        return self.player.get_length() / 1000.0
-
-    def is_playing(self):
-        return self.player.is_playing()
-
-    def seek(self, fraction):
-        length_ms = self.player.get_length()
-        if length_ms > 0:
-            self.player.set_time(int(fraction * length_ms))
-
-# ---------- YouTube-DL helpers ----------
+# ---------- Media resolution ----------
 def get_ydl_options():
-    opts = {
-        'format': 'bestaudio/best',
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'socket_timeout': 5,
-        'retries': 5,
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            'Referer': 'https://soundcloud.com/',
-        }
-    }
-    if cookies_path and os.path.exists(cookies_path):
-        opts['cookiefile'] = cookies_path
-    return opts
+    return media.get_ydl_options(cookies_path)
+
 
 def get_stream_url(media_url, retry_count=5):
-    for attempt in range(retry_count):
-        try:
-            with yt_dlp.YoutubeDL(get_ydl_options()) as ydl:
-                info = ydl.extract_info(media_url, download=False)
-                duration = info.get('duration', 0)
-                formats = info.get('formats', [])
-                audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
-                stream_url = max(audio_formats, key=lambda f: f.get('abr',0) or 0)['url'] if audio_formats else info['url']
-                return stream_url, duration
-        except Exception as e:
-            print(f"Stream error (attempt {attempt+1}): {e}")
-            if '429' in str(e):
-                time.sleep(3 * (2 ** attempt))
-            else:
-                break
-    raise Exception("Failed to extract stream after retries")
+    return media.get_stream_url(media_url, retry_count=retry_count, cookie_file=cookies_path)
+
 
 def get_playlist_tracks(playlist_url, retry=5):
-    if playlist_url in soundcloud_cache:
-        return soundcloud_cache[playlist_url]
-    opts = get_ydl_options()
-    opts.update({'extract_flat': False, 'playlistend': 100})
-    for attempt in range(retry):
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(playlist_url, download=False)
-                tracks = []
-                for entry in info.get('entries', []):
-                    if not entry: continue
-                    track_url = entry.get('webpage_url') or entry.get('url')
-                    if track_url:
-                        tracks.append({
-                            'title': entry.get('track') or entry.get('title') or 'Unknown Title',
-                            'artist': entry.get('artist') or entry.get('uploader') or entry.get('creator') or 'Unknown Artist',
-                            'url': track_url,
-                            'preview_url': track_url,
-                            'type': 'album',
-                            'album_name': None,
-                            'duration': entry.get('duration', 0)
-                        })
-            soundcloud_cache[playlist_url] = tracks
-            return tracks
-        except Exception as e:
-            print(f"Playlist error (attempt {attempt+1}): {e}")
-            if '429' in str(e):
-                time.sleep(3 * (2 ** attempt))
-            else:
-                break
-    return []
+    return media.get_playlist_tracks(playlist_url, retry=retry, cookie_file=cookies_path)
+
+
+def is_supported_media_url(media_url):
+    return media.is_supported_media_url(media_url)
+
 
 def find_media_url(page_url):
-    headers = {"User-Agent": "OCReMixJukebox/1.0"}
-    try:
-        resp = requests.get(page_url, headers=headers, timeout=10)
-        resp.raise_for_status()
-    except Exception:
-        return None
-    soup = BeautifulSoup(resp.text, 'html.parser')
-    direct = soup.find('a', href=re.compile(r'\.mp3$', re.I))
-    if direct:
-        return urljoin(page_url, direct['href'])
-    for iframe in soup.find_all('iframe', src=True):
-        src = iframe['src']
-        if 'youtube.com/embed/' in src or 'youtu.be/' in src:
-            return f"https://www.youtube.com/watch?v={src.split('/')[-1].split('?')[0]}"
-        if 'soundcloud.com/' in src:
-            return src
-    preview = soup.find('a', {'data-preview': True})
-    if preview and preview.get('data-preview'):
-        return preview['data-preview']
-    audio = soup.find('audio')
-    if audio:
-        src = audio.get('src') or (audio.find('source') and audio.find('source').get('src'))
-        if src:
-            return urljoin(page_url, src)
-    for a in soup.find_all('a', href=True):
-        href = a['href']
-        if 'ocremix.org' not in href:
-            return href
-    return None
+    return media.find_media_url(page_url)
+
 
 def is_soundcloud_profile(url):
-    if 'soundcloud.com/' in url:
-        parts = url.split('soundcloud.com/')[-1].strip('/').split('/')
-        return len(parts) == 1 and parts[0] and not parts[0].startswith('?')
-    return False
+    return media.is_soundcloud_profile(url)
 
-# ---------- UI Widgets ----------
-class TrackWidget(QFrame):
-    def __init__(self, track, game_id, parent=None):
-        super().__init__(parent)
-        self.track = track
-        self.game_id = game_id
-        self.init_ui()
 
-    def init_ui(self):
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 2, 5, 2)
-        self.play_button = QPushButton("▶")
-        self.play_button.setFixedWidth(30)
-        self.play_button.clicked.connect(lambda: self.window().play_track(self.track))
-        layout.addWidget(self.play_button)
+def validate_track_source(track):
+    preview = track.get('preview_url', '')
+    media_url = preview if preview and not is_soundcloud_profile(preview) else find_media_url(track.get('url', ''))
+    if not is_supported_media_url(media_url):
+        raise ValueError("No supported media URL was found on the track page")
+    with requests.head(media_url, allow_redirects=True, timeout=(3, 5)) as response:
+        if response.status_code >= 400:
+            raise ValueError(f"Media provider rejected the source URL (HTTP {response.status_code})")
+    track['media_url'] = media_url
+    return media_url
 
-        artist = self.track['artist']
-        if self.track.get('type') == 'remix' and artist.lower().startswith('arranged by') and artist[11:12] != ' ':
-            artist = artist[:11] + ' ' + artist[11:]
-        track_type = self.track.get('type', 'original')
-        prefix = {
-            'album': f"[A={self.track.get('album_name','').replace('Album: ','')}] " if self.track.get('album_name') else "[A] ",
-            'remix': "[R] ",
-            'original': "[O] "
-        }.get(track_type, "[O] ")
-        display = f"{prefix}{self.track['title']} — {artist}"
-        self.label = QLabel(display)
-        self.label.setWordWrap(True)
-        self.label.setCursor(Qt.PointingHandCursor)
-        self.label.mousePressEvent = lambda e: QDesktopServices.openUrl(QUrl(self.track['url']))
-        layout.addWidget(self.label, 1)
 
-        self.remove_button = QPushButton("✕")
-        self.remove_button.setFixedWidth(25)
-        self.remove_button.setStyleSheet("background-color: red;")
-        self.remove_button.clicked.connect(lambda: self.window().remove_track(self.game_id, self.track))
-        layout.addWidget(self.remove_button)
+def resolve_track_media(track, retry_count=2):
+    preview = track.get('preview_url', '')
+    media_url = track.get('media_url') or (
+        preview if preview and not is_soundcloud_profile(preview)
+        else find_media_url(track.get('url', ''))
+    )
+    if not is_supported_media_url(media_url):
+        raise ValueError("No supported media URL was found on the track page")
+    track['media_url'] = media_url
+    stream_url, duration, headers = get_stream_url(media_url, retry_count=retry_count)
+    parsed_stream = urlparse(stream_url) if isinstance(stream_url, str) else None
+    if not parsed_stream or parsed_stream.scheme not in ('http', 'https') or not parsed_stream.netloc:
+        raise ValueError("The resolved stream URL is not a valid HTTP URL")
+    track['resolved_stream_url'] = stream_url
+    track['resolved_headers'] = headers
+    track['resolved_at'] = time.monotonic()
+    track['resolved_duration'] = int(duration or track.get('duration') or 0)
+    if track['resolved_duration'] > 0:
+        track['duration'] = track['resolved_duration']
+    return stream_url, track['resolved_duration'], headers
 
-class GameWidget(QFrame):
-    def __init__(self, game_id, game_info, parent=None):
-        super().__init__(parent)
-        self.game_id = game_id
-        self.game_info = game_info
-        self.track_widgets = []
-        self.collapsed = False
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0,0,0,0)
-        layout.setSpacing(0)
-
-        self.header = QFrame()
-        header_layout = QHBoxLayout(self.header)
-        header_layout.setContentsMargins(5,5,5,5)
-        self.arrow_button = QPushButton("▼")
-        self.arrow_button.setFixedWidth(30)
-        self.arrow_button.setFlat(True)
-        self.arrow_button.clicked.connect(self.toggle_collapse)
-        header_layout.addWidget(self.arrow_button)
-
-        self.title_label = QLabel(self.game_info['name'])
-        font = self.title_label.font()
-        font.setBold(True)
-        self.title_label.setFont(font)
-        self.title_label.setCursor(Qt.PointingHandCursor)
-        self.title_label.mousePressEvent = lambda e: self.toggle_collapse()
-        header_layout.addWidget(self.title_label, 1)
-
-        self.remove_button = QPushButton("✕")
-        self.remove_button.setFixedWidth(30)
-        self.remove_button.clicked.connect(lambda: self.window().remove_game(self.game_id))
-        header_layout.addWidget(self.remove_button)
-        layout.addWidget(self.header)
-
-        self.track_container = QWidget()
-        self.track_layout = QVBoxLayout(self.track_container)
-        self.track_layout.setContentsMargins(0,0,0,0)
-        self.track_layout.setSpacing(1)
-        layout.addWidget(self.track_container)
-
-    def toggle_collapse(self):
-        self.collapsed = not self.collapsed
-        self.track_container.setVisible(not self.collapsed)
-        self.arrow_button.setText("▶" if self.collapsed else "▼")
-
-    def add_track(self, track):
-        widget = TrackWidget(track, self.game_id, self.parentWidget())
-        self.track_layout.addWidget(widget)
-        self.track_widgets.append(widget)
-
-    def clear_tracks(self):
-        for w in self.track_widgets:
-            w.deleteLater()
-        self.track_widgets.clear()
 
 # ---------- Signals ----------
 class UpdateSignals(QObject):
     append_track = pyqtSignal(str, dict)
+    append_browser_track = pyqtSignal(str, dict)
     update_loading_count = pyqtSignal(str, int)
     remove_loading_task = pyqtSignal(str)
     status_message = pyqtSignal(str)
     play_button_text = pyqtSignal(str)
-    start_playback = pyqtSignal(dict, str, int)
+    start_playback = pyqtSignal(dict, str, int, dict, int)
     loading_display_update = pyqtSignal()
     skip_to_next = pyqtSignal()
     skip_global_shuffle_next = pyqtSignal()
@@ -468,6 +281,7 @@ class UpdateSignals(QObject):
     media_next = pyqtSignal()
     media_previous = pyqtSignal()
     remove_invalid_track = pyqtSignal(str, dict)
+    track_playback_failed = pyqtSignal(dict)
     refresh_title = pyqtSignal()
     update_tray_tooltip = pyqtSignal(str)
 
@@ -483,6 +297,8 @@ class OCRemixWindow(QMainWindow):
         migrate_legacy_file("games_cache.json", self.cache_file)
         self.added_games = {}
         self.tracks_by_game = {}
+        self.selected_game_id = None
+        self.browsable_tracks = {}
         self.master_tracklist = []
         self.shuffle_queue = []
         self.shuffle_index = 0
@@ -494,6 +310,8 @@ class OCRemixWindow(QMainWindow):
         self.repeat_mode = 0
         self.last_played_track = None
         self.player = AudioPlayer()
+        self.play_request_id = 0
+        self.playback_started_at = None
         self.loading_tasks = {}
         self.signals = UpdateSignals()
         self.progress_timer = QTimer()
@@ -503,12 +321,15 @@ class OCRemixWindow(QMainWindow):
         self.global_thread = None
         self.settings = QSettings("OCRemix", "Jukebox")
         self.auto_remove_invalid = self.settings.value("auto_remove_invalid", False, type=bool)
+        self.hide_originals = self.settings.value("hide_originals", False, type=bool)
         self.auto_export_track = False
         self.export_file_path = None
         self.last_queue_path = self.settings.value("last_queue_path", "", type=str)
 
         self.setup_ui()
+        self.apply_app_styles()
         self.signals.append_track.connect(self.add_track_widget)
+        self.signals.append_browser_track.connect(self.add_browser_track_widget)
         self.signals.update_loading_count.connect(self.update_loading_count)
         self.signals.remove_loading_task.connect(self.remove_loading_task)
         self.signals.status_message.connect(self.status_label.setText)
@@ -521,6 +342,7 @@ class OCRemixWindow(QMainWindow):
         self.signals.media_next.connect(self.on_next)
         self.signals.media_previous.connect(self.on_previous)
         self.signals.remove_invalid_track.connect(self.remove_track)
+        self.signals.track_playback_failed.connect(self.handle_playback_failure)
         self.signals.refresh_title.connect(self.refresh_title)
         self.signals.update_tray_tooltip.connect(self.update_tray_tooltip)
 
@@ -538,60 +360,139 @@ class OCRemixWindow(QMainWindow):
         # left panel
         left = QWidget()
         left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0,0,0,0)
+        left_layout.setContentsMargins(8, 8, 8, 8)
+        browse_title = QLabel("Browse games")
+        browse_title.setObjectName("sectionTitle")
+        left_layout.addWidget(browse_title)
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search games...")
+        self.search_box.setClearButtonEnabled(True)
+        self.search_box.setPlaceholderText("Search by game or platform…")
+        self.search_box.setToolTip("Type to filter the game catalog")
         self.search_box.textChanged.connect(self.filter_games)
         left_layout.addWidget(self.search_box)
         self.game_list = QListWidget()
         self.game_list.itemClicked.connect(self.on_game_click)
         left_layout.addWidget(self.game_list)
+        self.game_count_label = QLabel("0 games")
+        self.game_count_label.setObjectName("mutedLabel")
+        left_layout.addWidget(self.game_count_label)
 
         # right panel
         right = QWidget()
         right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(8, 8, 8, 8)
+        right_splitter = QSplitter(Qt.Vertical)
+        browser_panel = QWidget()
+        browser_layout = QVBoxLayout(browser_panel)
+        browser_layout.setContentsMargins(0, 0, 0, 0)
+        browser_header = QHBoxLayout()
+        self.browser_title = QLabel("Select a game")
+        self.browser_title.setObjectName("sectionTitle")
+        browser_header.addWidget(self.browser_title)
+        browser_header.addStretch()
+        self.browser_summary = QLabel("No game selected")
+        self.browser_summary.setObjectName("mutedLabel")
+        browser_header.addWidget(self.browser_summary)
+        browser_layout.addLayout(browser_header)
+        self.browser_scroll = QScrollArea()
+        self.browser_scroll.setWidgetResizable(True)
+        self.browser_container = QWidget()
+        self.browser_tracks_layout = QVBoxLayout(self.browser_container)
+        self.browser_tracks_layout.setAlignment(Qt.AlignTop)
+        self.browser_empty_label = QLabel("Select a game on the left to browse its tracks.")
+        self.browser_empty_label.setObjectName("emptyState")
+        self.browser_empty_label.setAlignment(Qt.AlignCenter)
+        self.browser_tracks_layout.addWidget(self.browser_empty_label)
+        self.browser_scroll.setWidget(self.browser_container)
+        browser_layout.addWidget(self.browser_scroll)
+        right_splitter.addWidget(browser_panel)
+
+        queue_panel = QWidget()
+        queue_panel_layout = QVBoxLayout(queue_panel)
+        queue_panel_layout.setContentsMargins(0, 0, 0, 0)
+        queue_header = QHBoxLayout()
+        queue_title = QLabel("Queue")
+        queue_title.setObjectName("sectionTitle")
+        queue_header.addWidget(queue_title)
+        queue_header.addStretch()
+        self.queue_summary = QLabel("Queue empty")
+        self.queue_summary.setObjectName("mutedLabel")
+        queue_header.addWidget(self.queue_summary)
+        queue_panel_layout.addLayout(queue_header)
         self.queue_scroll = QScrollArea()
         self.queue_scroll.setWidgetResizable(True)
         self.queue_container = QWidget()
         self.queue_layout = QVBoxLayout(self.queue_container)
         self.queue_layout.setAlignment(Qt.AlignTop)
+        self.empty_queue_label = QLabel("Your queue is empty\n\nPress + on a track above to add it.")
+        self.empty_queue_label.setObjectName("emptyState")
+        self.empty_queue_label.setAlignment(Qt.AlignCenter)
+        self.empty_queue_label.setMinimumHeight(220)
+        self.queue_layout.addWidget(self.empty_queue_label)
         self.queue_scroll.setWidget(self.queue_container)
-        right_layout.addWidget(self.queue_scroll)
+        queue_panel_layout.addWidget(self.queue_scroll)
+        right_splitter.addWidget(queue_panel)
+        right_splitter.setStretchFactor(0, 3)
+        right_splitter.setStretchFactor(1, 2)
+        right_layout.addWidget(right_splitter, 1)
 
         self.loading_label = QLabel()
         self.loading_label.setVisible(False)
         right_layout.addWidget(self.loading_label)
 
         # controls
-        ctrl = QHBoxLayout()
-        self.shuffle_button = QPushButton("Shuffle All")
+        playback_bar = QHBoxLayout()
+        self.shuffle_button = QPushButton("Shuffle queue")
+        self.shuffle_button.setCheckable(True)
+        self.shuffle_button.setToolTip("Play the current queue in random order")
         self.shuffle_button.clicked.connect(self.toggle_shuffle)
-        ctrl.addWidget(self.shuffle_button)
-        self.global_shuffle_button = QPushButton("Global Shuffle")
+        playback_bar.addWidget(self.shuffle_button)
+        self.global_shuffle_button = QPushButton("Global shuffle")
+        self.global_shuffle_button.setCheckable(True)
+        self.global_shuffle_button.setToolTip("Discover and play tracks from the full catalog")
         self.global_shuffle_button.clicked.connect(self.toggle_global_shuffle)
-        ctrl.addWidget(self.global_shuffle_button)
+        playback_bar.addWidget(self.global_shuffle_button)
+        playback_bar.addStretch()
         self.prev_button = QPushButton("⏮")
+        self.prev_button.setToolTip("Previous track")
         self.prev_button.clicked.connect(self.on_previous)
-        ctrl.addWidget(self.prev_button)
+        playback_bar.addWidget(self.prev_button)
         self.play_button = QPushButton("▶")
+        self.play_button.setObjectName("primaryPlayButton")
+        self.play_button.setToolTip("Play or pause")
         self.play_button.clicked.connect(self.on_play_pause)
-        ctrl.addWidget(self.play_button)
+        playback_bar.addWidget(self.play_button)
         self.next_button = QPushButton("⏭")
+        self.next_button.setToolTip("Next track")
         self.next_button.clicked.connect(self.on_next)
-        ctrl.addWidget(self.next_button)
+        playback_bar.addWidget(self.next_button)
         self.repeat_button = QPushButton("🔁 Off")
+        self.repeat_button.setToolTip("Change repeat mode")
         self.repeat_button.clicked.connect(self.toggle_repeat)
-        ctrl.addWidget(self.repeat_button)
-        self.position_slider = QSlider(Qt.Horizontal)
-        self.position_slider.setRange(0, 1000)
-        self.position_slider.sliderMoved.connect(self.seek)
-        ctrl.addWidget(self.position_slider, 1)
+        playback_bar.addWidget(self.repeat_button)
+        playback_bar.addWidget(QLabel("🔊"))
         self.volume_slider = QSlider(Qt.Horizontal)
         self.volume_slider.setRange(0, 100)
-        self.volume_slider.setValue(70)
+        self.volume_slider.setValue(self.settings.value("volume", 70, type=int))
+        self.volume_slider.setFixedWidth(110)
+        self.volume_slider.setToolTip("Volume")
         self.volume_slider.valueChanged.connect(self.change_volume)
-        ctrl.addWidget(self.volume_slider)
-        right_layout.addLayout(ctrl)
+        playback_bar.addWidget(self.volume_slider)
+        right_layout.addLayout(playback_bar)
+
+        timeline = QHBoxLayout()
+        self.elapsed_label = QLabel("0:00")
+        self.elapsed_label.setObjectName("mutedLabel")
+        timeline.addWidget(self.elapsed_label)
+        self.position_slider = QSlider(Qt.Horizontal)
+        self.position_slider.setRange(0, 1000)
+        self.position_slider.setToolTip("Seek through the current track")
+        self.position_slider.sliderMoved.connect(self.seek)
+        timeline.addWidget(self.position_slider, 1)
+        self.duration_label = QLabel("0:00")
+        self.duration_label.setObjectName("mutedLabel")
+        timeline.addWidget(self.duration_label)
+        right_layout.addLayout(timeline)
 
         self.status_label = QLabel("Ready")
         self.status_label.setCursor(Qt.PointingHandCursor)
@@ -614,6 +515,10 @@ class OCRemixWindow(QMainWindow):
         self.auto_remove_action.setChecked(self.auto_remove_invalid)
         self.auto_remove_action.triggered.connect(self.toggle_auto_remove)
         file_menu.addAction(self.auto_remove_action)
+        self.hide_originals_action = QAction("Hide original [O] tracks", self, checkable=True)
+        self.hide_originals_action.setChecked(self.hide_originals)
+        self.hide_originals_action.triggered.connect(self.toggle_hide_originals)
+        file_menu.addAction(self.hide_originals_action)
         self.auto_export_action = QAction("Auto‑export current track to file", self, checkable=True)
         self.auto_export_action.triggered.connect(self.toggle_auto_export)
         file_menu.addAction(self.auto_export_action)
@@ -631,10 +536,50 @@ class OCRemixWindow(QMainWindow):
         main_layout.addWidget(splitter)
         central.setLayout(main_layout)
 
+    def apply_app_styles(self):
+        dark = is_dark_mode()
+        background = "#1e1f22" if dark else "#f7f7f9"
+        surface = "#2b2d31" if dark else "#ffffff"
+        border = "#41454c" if dark else "#d8dbe1"
+        text = "#f3f4f6" if dark else "#202124"
+        muted = "#aeb2ba" if dark else "#686b73"
+        accent = "#56a8ff"
+        self.setStyleSheet(f"""
+            QMainWindow {{ background: {background}; color: {text}; }}
+            QWidget {{ color: {text}; }}
+            QLineEdit, QListWidget, QScrollArea {{
+                background: {surface}; border: 1px solid {border}; border-radius: 8px;
+            }}
+            QLineEdit {{ padding: 8px; selection-background-color: {accent}; }}
+            QListWidget::item {{ padding: 7px 8px; border-radius: 5px; }}
+            QListWidget::item:selected {{ background: {accent}; color: #101418; }}
+            QPushButton {{
+                background: {surface}; border: 1px solid {border}; border-radius: 7px;
+                padding: 6px 10px;
+            }}
+            QPushButton:hover {{ border-color: {accent}; }}
+            QPushButton:checked {{ background: {accent}; color: #101418; border-color: {accent}; }}
+            QPushButton#primaryPlayButton {{
+                background: {accent}; color: #101418; border-color: {accent};
+                min-width: 42px; min-height: 34px; font-weight: bold; font-size: 17px;
+            }}
+            QLabel#sectionTitle {{ font-size: 16px; font-weight: 700; padding: 2px; }}
+            QLabel#mutedLabel {{ color: {muted}; }}
+            QLabel#emptyState {{ color: {muted}; font-size: 14px; padding: 40px; }}
+            QFrame[active="true"] {{ background: rgba(86, 168, 255, 0.12); border: 1px solid {accent}; border-radius: 7px; }}
+            QStatusBar {{ border-top: 1px solid {border}; }}
+        """)
+
     # ---------- Settings ----------
     def toggle_auto_remove(self, checked):
         self.auto_remove_invalid = checked
         self.settings.setValue("auto_remove_invalid", checked)
+
+    def toggle_hide_originals(self, checked):
+        self.hide_originals = checked
+        self.settings.setValue("hide_originals", checked)
+        if self.selected_game_id is not None:
+            self.show_browsable_tracks(self.selected_game_id)
 
     def toggle_auto_export(self, checked):
         self.auto_export_track = checked
@@ -684,6 +629,16 @@ class OCRemixWindow(QMainWindow):
 
     def refresh_title(self):
         count = len(self.master_tracklist)
+        self.empty_queue_label.setVisible(not self.added_games)
+        self.queue_summary.setText(
+            f"{count} track{'s' if count != 1 else ''} · {len(self.added_games)} game{'s' if len(self.added_games) != 1 else ''}"
+            if count else "Queue empty"
+        )
+        for widget in self.queue_container.findChildren(TrackWidget):
+            active = self.current_track is not None and widget.track['url'] == self.current_track.get('url')
+            widget.setProperty("active", active)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
         if self.current_track:
             game = self.current_track.get('game_name', '')
             title = self.current_track.get('title', '')
@@ -778,6 +733,9 @@ class OCRemixWindow(QMainWindow):
         self.game_list.clear()
         for gid in self.filtered_game_ids:
             self.game_list.addItem(self.game_catalog[gid]['name'])
+        shown = len(self.filtered_game_ids)
+        total = len(self.game_catalog)
+        self.game_count_label.setText(f"{shown} of {total} games" if query else f"{total} games")
 
     def adjust_game_list_width(self):
         if self.game_catalog:
@@ -791,69 +749,121 @@ class OCRemixWindow(QMainWindow):
 
     # ---------- Adding games ----------
     def add_game(self, game_id):
-        if game_id in self.added_games:
-            self.status_label.setText("Game already in queue")
-            return
+        self.selected_game_id = game_id
         info = self.game_catalog[game_id]
-        self.added_games[game_id] = info
-        self.tracks_by_game[game_id] = []
-        widget = GameWidget(game_id, info, self)
-        self.queue_layout.addWidget(widget)
-        self.added_games[game_id]['widget'] = widget
+        self.browser_title.setText(info['name'])
+        self.clear_browser_tracks()
+        cached = self.browsable_tracks.get(game_id)
+        if cached is not None:
+            self.show_browsable_tracks(game_id)
+            return
+        self.browsable_tracks[game_id] = []
+        self.browser_empty_label.setText("Loading and validating tracks…")
+        self.browser_empty_label.show()
+        self.browser_summary.setText("Loading…")
         self.add_loading_task(game_id, info['name'])
-        self.status_label.setText(f"Fetching tracks for {info['name']}...")
+        self.status_label.setText(f"Discovering tracks for {info['name']}…")
         threading.Thread(target=self.load_tracks_incremental, args=(game_id,), daemon=True).start()
-        self.signals.refresh_title.emit()
+
+    def clear_browser_tracks(self):
+        while self.browser_tracks_layout.count():
+            item = self.browser_tracks_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self.browser_empty_label = QLabel("No playable tracks found for this game.")
+        self.browser_empty_label.setObjectName("emptyState")
+        self.browser_empty_label.setAlignment(Qt.AlignCenter)
+        self.browser_tracks_layout.addWidget(self.browser_empty_label)
 
     def load_tracks_incremental(self, game_id):
         url = self.game_catalog[game_id]['url']
         headers = {"User-Agent": "OCReMixJukebox/1.0"}
         main = url.rstrip('/')
         count = 0
+        rejected = 0
+        discovered = 0
+        pending = set()
         game_name = self.game_catalog[game_id]['name']
 
-        def process(track):
-            nonlocal count
-            track.update({'game_id': game_id, 'game_name': game_name, 'duration': track.get('duration', 0)})
-            self.tracks_by_game[game_id].append(track)
-            self.master_tracklist.append(track)
+        def report_progress(active, completed):
+            self.signals.status_message.emit(
+                f"Validating {game_name}: {completed} checked, {active} in progress…"
+            )
+
+        def collect(future):
+            nonlocal count, rejected
+            try:
+                track = future.result()
+            except Exception as error:
+                rejected += 1
+                print(f"Skipping unavailable track: {error}")
+                report_progress(max(0, len(pending) - 1), count + rejected)
+                return
+            self.browsable_tracks.setdefault(game_id, []).append(track)
             count += 1
-            self.signals.append_track.emit(game_id, track)
+            report_progress(max(0, len(pending) - 1), count + rejected)
+            self.signals.append_browser_track.emit(game_id, track)
             self.signals.update_loading_count.emit(game_id, count)
             self.signals.refresh_title.emit()
 
-        try:
-            for t in self.scrape_stream(main, '/song/', headers):
-                process(t)
-        except Exception as e:
-            print(f"Originals error: {e}")
-        try:
-            for t in self.scrape_stream(main + '/remixes', '/remix/', headers):
-                process(t)
-        except Exception as e:
-            print(f"Remixes error: {e}")
-        try:
-            resp = requests.get(main, headers=headers, timeout=10)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            items = []
-            for a in soup.find_all('a', href=lambda h: h and '/album/' in h):
-                parent = a.find_parent('div', class_='widget-neutral')
-                if parent and 'Promotion' in parent.get_text():
-                    continue
-                items.append((urljoin(main, a['href']), a.get_text(strip=True)))
-            for idx, (album_url, album_name) in enumerate(items):
-                if idx > 0:
-                    time.sleep(2)
-                try:
-                    for t in self.scrape_album(album_url, headers, album_name):
-                        process(t)
-                except Exception as e:
-                    print(f"Album error {album_url}: {e}")
-        except Exception as e:
-            print(f"Album discovery error: {e}")
+        def validate(track):
+            track.update({'game_id': game_id, 'game_name': game_name, 'duration': track.get('duration', 0)})
+            resolve_track_media(track, retry_count=1)
+            return track
+
+        def drain_all(executor):
+            for future in as_completed(tuple(pending)):
+                collect(future)
+                pending.discard(future)
+
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="track-check") as executor:
+            def submit(track):
+                nonlocal discovered
+                discovered += 1
+                future = executor.submit(validate, track)
+                pending.add(future)
+                report_progress(len(pending), count + rejected)
+                if len(pending) >= 4:
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for completed in done:
+                        collect(completed)
+                        pending.discard(completed)
+
+            try:
+                for track in self.scrape_stream(main, '/song/', headers):
+                    submit(track)
+            except Exception as error:
+                print(f"Originals error: {error}")
+            try:
+                for track in self.scrape_stream(main + '/remixes', '/remix/', headers):
+                    submit(track)
+            except Exception as error:
+                print(f"Remixes error: {error}")
+            try:
+                response = requests.get(main, headers=headers, timeout=10)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, 'html.parser')
+                albums = []
+                for link in soup.find_all('a', href=lambda href: href and '/album/' in href):
+                    parent = link.find_parent('div', class_='widget-neutral')
+                    if parent and 'Promotion' in parent.get_text():
+                        continue
+                    albums.append((urljoin(main, link['href']), link.get_text(strip=True)))
+                for index, (album_url, album_name) in enumerate(albums):
+                    if index > 0:
+                        time.sleep(2)
+                    try:
+                        for track in self.scrape_album(album_url, headers, album_name):
+                            submit(track)
+                    except Exception as error:
+                        print(f"Album error {album_url}: {error}")
+            except Exception as error:
+                print(f"Album discovery error: {error}")
+            drain_all(executor)
         self.signals.remove_loading_task.emit(game_id)
-        self.signals.status_message.emit(f"Added {game_name} ({count} tracks)")
+        suffix = f", skipped {rejected} unavailable" if rejected else ""
+        self.signals.status_message.emit(f"Loaded {game_name} ({count} playable tracks{suffix})")
 
     def scrape_stream(self, page_url, link_pattern, headers):
         resp = requests.get(page_url, headers=headers, timeout=10)
@@ -1010,6 +1020,47 @@ class OCRemixWindow(QMainWindow):
         if widget:
             widget.add_track(track)
 
+    def show_browsable_tracks(self, game_id):
+        self.clear_browser_tracks()
+        for track in self.browsable_tracks.get(game_id, []):
+            self.add_browser_track_widget(game_id, track)
+        visible = sum(
+            1 for track in self.browsable_tracks.get(game_id, [])
+            if not (self.hide_originals and track.get('type') == 'original')
+        )
+        self.browser_summary.setText(f"{visible} visible tracks")
+
+    def add_browser_track_widget(self, game_id, track):
+        if game_id != self.selected_game_id:
+            return
+        if self.hide_originals and track.get('type') == 'original':
+            self.browser_summary.setText("Original tracks hidden")
+            return
+        self.browser_empty_label.hide()
+        widget = TrackWidget(track, game_id, self.browser_container, queue_item=False)
+        self.browser_tracks_layout.addWidget(widget)
+        self.browser_summary.setText(
+            f"{len(self.browsable_tracks.get(game_id, []))} playable tracks"
+        )
+
+    def add_track_to_queue(self, game_id, track):
+        if game_id not in self.added_games:
+            info = self.game_catalog[game_id]
+            self.added_games[game_id] = info
+            self.tracks_by_game[game_id] = []
+            widget = GameWidget(game_id, info, self.queue_container)
+            self.queue_layout.insertWidget(max(0, self.queue_layout.count() - 1), widget)
+            self.added_games[game_id]['widget'] = widget
+        if any(item['url'] == track['url'] for item in self.tracks_by_game[game_id]):
+            self.status_label.setText(f"Already queued: {track['title']}")
+            return
+        queued = dict(track)
+        self.tracks_by_game[game_id].append(queued)
+        self.master_tracklist = self.rebuild_master_list()
+        self.add_track_widget(game_id, queued)
+        self.status_label.setText(f"Queued: {track['title']}")
+        self.signals.refresh_title.emit()
+
     # ---------- Playback ----------
     def play_track(self, track):
         if self.global_shuffle_active:
@@ -1035,13 +1086,20 @@ class OCRemixWindow(QMainWindow):
                     if self.shuffle_index > len(self.shuffle_queue):
                         self.shuffle_index = len(self.shuffle_queue)
                 if self.current_track and self.current_track['url'] == track['url']:
+                    self.play_request_id += 1
                     self.player.stop()
+                    self.current_track = None
                     self.play_button.setText("▶")
                     self.position_slider.setValue(0)
-                    self.handle_track_end()
                 self.signals.refresh_title.emit()
 
     def remove_game(self, game_id):
+        if self.current_track and self.current_track.get('game_id') == game_id:
+            self.play_request_id += 1
+            self.player.stop()
+            self.current_track = None
+            self.play_button.setText("▶")
+            self.position_slider.setValue(0)
         if game_id in self.added_games:
             widget = self.added_games[game_id].get('widget')
             if widget:
@@ -1085,7 +1143,7 @@ class OCRemixWindow(QMainWindow):
                 'title': t['title'], 'artist': t['artist'], 'url': t['url'],
                 'preview_url': t.get('preview_url', ''), 'type': t.get('type', 'original'),
                 'album_name': t.get('album_name'), 'duration': t.get('duration', 0),
-                'game_name': t.get('game_name', info['name'])
+                'game_name': t.get('game_name', info['name']), 'media_url': t.get('media_url', '')
             } for t in self.tracks_by_game.get(gid, [])]
             data.append({'game_id': gid, 'game_name': info['name'], 'game_url': info['url'],
                          'platform': info.get('platform', ''), 'tracks': serial})
@@ -1106,6 +1164,14 @@ class OCRemixWindow(QMainWindow):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+            if not isinstance(data, list) or any(
+                not isinstance(game, dict)
+                or not all(game.get(field) for field in ('game_id', 'game_name', 'game_url'))
+                or not isinstance(game.get('tracks'), list)
+                or not all(isinstance(track, dict) and track.get('title') and track.get('url') for track in game.get('tracks', []))
+                for game in data
+            ):
+                raise ValueError("This is not a valid OC ReMix queue file.")
         except Exception as e:
             QMessageBox.critical(self, "Load Error", f"Failed to read file: {e}")
             return
@@ -1132,7 +1198,8 @@ class OCRemixWindow(QMainWindow):
                     'title': tdata['title'], 'artist': tdata['artist'], 'url': tdata['url'],
                     'preview_url': tdata.get('preview_url', ''), 'type': tdata.get('type', 'original'),
                     'album_name': tdata.get('album_name'), 'duration': tdata.get('duration', 0),
-                    'game_name': tdata.get('game_name', info['name']), 'game_id': gid
+                    'game_name': tdata.get('game_name', info['name']), 'game_id': gid,
+                    'media_url': tdata.get('media_url', '')
                 }
                 self.tracks_by_game[gid].append(track)
                 self.master_tracklist.append(track)
@@ -1143,45 +1210,69 @@ class OCRemixWindow(QMainWindow):
         self.signals.refresh_title.emit()
 
     def _play_track(self, track):
-        self.signals.status_message.emit(f"Loading: {track['title']}...")
-        self.signals.play_button_text.emit("⏸")
+        self.play_request_id += 1
+        request_id = self.play_request_id
+        self.player.stop()
+        self.play_button.setText("…")
+        self.play_button.setToolTip("Loading track…")
+        self.status_label.setText(f"Loading: {track['title']}…")
+
         def worker():
-            self.player.stop()
-            self.current_track = track
-            self.last_played_track = track
-            game_name = track.get('game_name', '')
-            artist = track.get('artist', '')
-            self.signals.update_tray_tooltip.emit(f"{game_name} - {track['title']} — {artist}" if game_name else f"{track['title']} — {artist}")
             try:
-                preview = track.get('preview_url', '')
-                media_url = preview if (preview and not is_soundcloud_profile(preview)) else find_media_url(track['url'])
-                if not media_url or media_url == '/' or not media_url.startswith(('http://','https://')):
-                    raise Exception("No valid media URL")
-                stream, duration = get_stream_url(media_url)
+                resolved_at = track.get('resolved_at', 0)
+                if track.get('resolved_stream_url') and time.monotonic() - resolved_at < 300:
+                    stream = track['resolved_stream_url']
+                    duration = int(track.get('resolved_duration') or track.get('duration') or 0)
+                    http_headers = track.get('resolved_headers', {})
+                else:
+                    stream, duration, http_headers = resolve_track_media(track, retry_count=3)
+                if request_id != self.play_request_id:
+                    return
                 if duration > 0:
                     track['duration'] = duration
-                self.signals.start_playback.emit(track, stream, duration)
-            except Exception as e:
-                print(f"Skipping {track['title']}: {e}")
-                self.signals.status_message.emit(f"⏭️ Skipping: {track['title']}")
+                self.signals.start_playback.emit(track, stream, duration, http_headers, request_id)
+            except Exception as error:
+                if request_id != self.play_request_id:
+                    return
+                print(f"Skipping {track['title']}: {error}")
+                self.signals.status_message.emit(f"Could not play {track['title']}: {error}")
                 self.signals.play_button_text.emit("▶")
-                if self.auto_remove_invalid:
-                    self.signals.remove_invalid_track.emit(track.get('game_id', ''), track)
-                if self.shuffle_active:
-                    self.signals.skip_to_next.emit()
-                elif self.global_shuffle_active:
-                    self.signals.skip_global_shuffle_next.emit()
-                else:
-                    try:
-                        idx = self.master_tracklist.index(self.current_track)
-                        if idx + 1 < len(self.master_tracklist):
-                            self._play_track(self.master_tracklist[idx + 1])
-                    except ValueError:
-                        pass
+                self.signals.track_playback_failed.emit(track)
+
         threading.Thread(target=worker, daemon=True).start()
 
-    def start_playback(self, track, stream_url, duration):
-        self.player.play_stream(stream_url, duration)
+    def handle_playback_failure(self, track):
+        next_track = None
+        if not (self.shuffle_active or self.global_shuffle_active) and self.master_tracklist:
+            try:
+                next_index = self.master_tracklist.index(track) + 1
+                if next_index < len(self.master_tracklist):
+                    next_track = self.master_tracklist[next_index]
+            except ValueError:
+                pass
+        if self.auto_remove_invalid:
+            self.remove_track(track.get('game_id', ''), track)
+        if self.shuffle_active:
+            self.play_next_in_queue()
+        elif self.global_shuffle_active:
+            self.global_shuffle_next()
+        elif next_track:
+            self._play_track(next_track)
+
+    def start_playback(self, track, stream_url, duration, http_headers, request_id):
+        if request_id != self.play_request_id:
+            return
+        try:
+            self.player.play_stream(stream_url, duration, http_headers)
+        except Exception as error:
+            self.status_label.setText(f"Playback failed: {error}")
+            self.play_button.setText("▶")
+            self.play_button.setToolTip("Play or pause")
+            self.handle_playback_failure(track)
+            return
+        self.current_track = track
+        self.last_played_track = track
+        self.playback_started_at = time.monotonic()
         self.play_history.append(track)
         if len(self.play_history) > 50:
             self.play_history.pop(0)
@@ -1190,7 +1281,9 @@ class OCRemixWindow(QMainWindow):
         if track.get('type') == 'remix' and artist.lower().startswith('arranged by') and artist[11:12] != ' ':
             artist = artist[:11] + ' ' + artist[11:]
         self.status_label.setText(f"Now playing: {game_name} - {track['title']} — {artist}" if game_name else f"Now playing: {track['title']} — {artist}")
+        self.tray_icon.setToolTip(self.status_label.text())
         self.play_button.setText("⏸")
+        self.play_button.setToolTip("Pause")
         self.position_slider.setValue(0)
         self.signals.refresh_title.emit()
         QTimer.singleShot(1000, self.refresh_length)
@@ -1212,13 +1305,16 @@ class OCRemixWindow(QMainWindow):
 
     def start_shuffle(self):
         if not self.master_tracklist:
-            self.status_label.setText("Add some games first!")
+            self.status_label.setText("Add a game before starting shuffle.")
+            self.shuffle_button.setChecked(False)
             return
         if self.global_shuffle_active:
             self.stop_global_shuffle()
         self.shuffle_active = True
-        self.shuffle_button.setText("Stop Shuffle")
-        self.global_shuffle_button.setText("Global Shuffle")
+        self.shuffle_button.setChecked(True)
+        self.shuffle_button.setText("Stop shuffle")
+        self.global_shuffle_button.setChecked(False)
+        self.global_shuffle_button.setText("Global shuffle")
         tracks = self.master_tracklist.copy()
         random.shuffle(tracks)
         if self.last_played_track and len(tracks) > 1 and tracks[0] == self.last_played_track:
@@ -1232,7 +1328,9 @@ class OCRemixWindow(QMainWindow):
 
     def stop_shuffle(self):
         self.shuffle_active = False
-        self.shuffle_button.setText("Shuffle All")
+        self.play_request_id += 1
+        self.shuffle_button.setChecked(False)
+        self.shuffle_button.setText("Shuffle queue")
         self.player.stop()
         self.play_button.setText("▶")
         self.position_slider.setValue(0)
@@ -1267,13 +1365,18 @@ class OCRemixWindow(QMainWindow):
             self.play_next_in_queue()
         elif self.global_shuffle_active:
             self.global_shuffle_next()
-        else:
+        elif self.master_tracklist:
             try:
                 idx = self.master_tracklist.index(self.current_track)
-                if idx + 1 < len(self.master_tracklist):
-                    self._play_track(self.master_tracklist[idx + 1])
             except ValueError:
-                pass
+                idx = -1
+            next_index = idx + 1
+            if next_index >= len(self.master_tracklist):
+                if self.repeat_mode == 2:
+                    next_index = 0
+                else:
+                    return
+            self._play_track(self.master_tracklist[next_index])
 
     def on_previous(self):
         if len(self.play_history) >= 2:
@@ -1296,21 +1399,26 @@ class OCRemixWindow(QMainWindow):
 
     def start_global_shuffle(self):
         if not self.game_catalog:
+            self.global_shuffle_button.setChecked(False)
             self.status_label.setText("No games loaded. Please refresh first.")
             return
         if self.shuffle_active:
             self.stop_shuffle()
         self.global_shuffle_active = True
-        self.global_shuffle_button.setText("Stop Global")
-        self.shuffle_button.setText("Shuffle All")
+        self.global_shuffle_button.setChecked(True)
+        self.global_shuffle_button.setText("Stop global")
+        self.shuffle_button.setChecked(False)
+        self.shuffle_button.setText("Shuffle queue")
         self.global_stop.clear()
         self.global_thread = threading.Thread(target=self.global_loop, daemon=True)
         self.global_thread.start()
 
     def stop_global_shuffle(self):
         self.global_shuffle_active = False
+        self.play_request_id += 1
         self.global_stop.set()
-        self.global_shuffle_button.setText("Global Shuffle")
+        self.global_shuffle_button.setChecked(False)
+        self.global_shuffle_button.setText("Global shuffle")
         self.player.stop()
         self.play_button.setText("▶")
         self.position_slider.setValue(0)
@@ -1391,66 +1499,101 @@ class OCRemixWindow(QMainWindow):
 
     # ---------- Repeat, Play/Pause, Volume, Seek ----------
     def handle_track_end(self):
-        if self.repeat_mode == 1:
-            if self.current_track:
-                self._play_track(self.current_track)
+        self.player.current_url = None
+        self.player.paused = False
+        if self.repeat_mode == 1 and self.current_track:
+            self._play_track(self.current_track)
+        elif self.shuffle_active:
+            self.play_next_in_queue()
+        elif self.global_shuffle_active:
             return
-        if self.repeat_mode == 2:
-            if self.shuffle_active:
-                self.play_next_in_queue()
-            return
-        if self.repeat_mode == 3:
-            if self.shuffle_active:
-                self.play_next_in_queue()
-            else:
-                self.player.stop()
+        elif self.repeat_mode in (2, 3):
+            self.on_next()
+            if self.play_button.text() != "…":
                 self.play_button.setText("▶")
                 self.position_slider.setValue(0)
-            return
-        if self.shuffle_active:
-            self.play_next_in_queue()
-        elif not self.global_shuffle_active:
-            self.player.stop()
+        else:
             self.play_button.setText("▶")
             self.position_slider.setValue(0)
+            self.elapsed_label.setText("0:00")
 
     def toggle_repeat(self):
         self.repeat_mode = (self.repeat_mode + 1) % 4
-        labels = {0: "🔁 Off", 1: "🔁 One", 2: "🔁 All", 3: "▶️ Sequential"}
+        labels = {0: "🔁 Off", 1: "🔁 One", 2: "🔁 All", 3: "➡️ Queue"}
+        descriptions = {
+            0: "Repeat off: stop after the current track",
+            1: "Repeat one: replay the current track",
+            2: "Repeat all: loop the queue",
+            3: "Queue: continue through tracks, then stop",
+        }
         self.repeat_button.setText(labels[self.repeat_mode])
+        self.repeat_button.setToolTip(descriptions[self.repeat_mode])
 
     def on_play_pause(self):
         if self.player.current_url is None:
+            if self.play_button.text() == "…":
+                self.play_request_id += 1
+                self.play_button.setText("▶")
+                self.status_label.setText("Loading cancelled")
+            elif self.master_tracklist:
+                self._play_track(self.master_tracklist[0])
             return
         self.player.pause()
         self.play_button.setText("▶" if self.player.paused else "⏸")
+        self.play_button.setToolTip("Resume" if self.player.paused else "Pause")
 
     def change_volume(self, val):
         self.player.set_volume(val)
+        self.settings.setValue("volume", val)
 
     def seek(self, value):
         if self.player.current_url:
             self.player.seek(value / 1000.0)
 
     def update_progress(self):
-        if self.player.is_playing():
+        if self.player.current_url:
+            state = self.player.player.get_state()
+            if state == vlc.State.Playing:
+                self.playback_started_at = None
+            elif state == vlc.State.Error:
+                track = self.current_track
+                self.player.stop()
+                self.playback_started_at = None
+                self.play_button.setText("▶")
+                self.status_label.setText("VLC could not open the resolved stream URL.")
+                if track:
+                    self.handle_playback_failure(track)
+                return
+            elif state in (vlc.State.Opening, vlc.State.Buffering) and self.playback_started_at:
+                waited = time.monotonic() - self.playback_started_at
+                if waited > 15:
+                    track = self.current_track
+                    self.player.stop()
+                    self.playback_started_at = None
+                    self.play_button.setText("▶")
+                    self.status_label.setText("Playback timed out while opening the stream.")
+                    if track:
+                        self.handle_playback_failure(track)
+                    return
+                self.status_label.setText(f"Opening stream… ({int(waited)}s)")
             pos = self.player.get_pos()
             length = self.player.get_length()
-            if length == 0 and self.current_track and self.current_track.get('duration', 0) > 0:
-                length = self.current_track['duration']
             if length > 0 and pos >= 0:
-                self.position_slider.setValue(int((pos / length) * 1000))
+                if not self.position_slider.isSliderDown():
+                    self.position_slider.setValue(int((pos / length) * 1000))
                 cur = time.strftime('%M:%S', time.gmtime(pos))
                 total = time.strftime('%M:%S', time.gmtime(length))
+                self.elapsed_label.setText(cur)
+                self.duration_label.setText(total)
                 if self.current_track:
                     artist = self.current_track['artist']
                     if self.current_track.get('type') == 'remix' and artist.lower().startswith('arranged by') and artist[11:12] != ' ':
                         artist = artist[:11] + ' ' + artist[11:]
                     game = self.current_track.get('game_name', '')
-                    self.status_label.setText(f"Now playing: {game} - {self.current_track['title']} — {artist}  [{cur} / {total}]" if game else f"Now playing: {self.current_track['title']} — {artist}  [{cur} / {total}]")
-        if self.player.current_url and not self.player.is_playing() and not self.player.paused:
-            if self.player.player.get_state() == vlc.State.Ended:
-                self.handle_track_end()
+                    playback_state = "Paused: " if self.player.paused else "Now playing: "
+                    self.status_label.setText(f"{playback_state}{game} - {self.current_track['title']} — {artist}  [{cur} / {total}]" if game else f"{playback_state}{self.current_track['title']} — {artist}  [{cur} / {total}]")
+        if self.player.current_url and self.player.player.get_state() == vlc.State.Ended:
+            self.handle_track_end()
 
     # ---------- Cookies ----------
     def load_cookies(self):
@@ -1464,6 +1607,9 @@ class OCRemixWindow(QMainWindow):
         if plain:
             cookies_path = plain
             self.status_label.setText("SoundCloud cookies loaded (plain text)")
+            return
+        if cookie_load_error:
+            self.status_label.setText(cookie_load_error)
             return
         self.status_label.setText("No SoundCloud cookies found. Click Manage to add.")
 
@@ -1548,12 +1694,11 @@ class OCRemixWindow(QMainWindow):
             self.tray_icon.hide()
         if self.progress_timer:
             self.progress_timer.stop()
-        QApplication.quit()
-        sys.exit(0)
+        QApplication.instance().quit()
 
     def closeEvent(self, event):
-        self.quit_app()
         event.accept()
+        QTimer.singleShot(0, self.quit_app)
 
     def changeEvent(self, event):
         if event.type() == event.WindowStateChange and self.isMinimized():
