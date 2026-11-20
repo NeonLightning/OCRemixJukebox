@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, re, json, time, threading, random, tempfile, base64, uuid, shutil
+import sys, os, re, json, time, threading, random, tempfile, base64, uuid, shutil, subprocess
 from urllib.parse import urljoin, urlencode, unquote
 from bs4 import BeautifulSoup
 from cryptography.fernet import Fernet
@@ -10,16 +10,42 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
     QMessageBox, QFileDialog, QSystemTrayIcon, QMenu, QAction, QFrame, QStyleFactory)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QSettings, QUrl
 from PyQt5.QtGui import QIcon, QPixmap, QPalette, QColor, QDesktopServices
-from pynput import keyboard as pynput_keyboard
+try:
+    from pynput import keyboard as pynput_keyboard
+except (ImportError, OSError):
+    pynput_keyboard = None
 import requests, yt_dlp, vlc
 
 os.environ['VLC_VERBOSE'] = '-1'
 
 soundcloud_cache = {}
 cookies_path = None
-encrypted_cookies_file = "soundcloud_cookies.enc"
-plain_cookies_file = "soundcloud_cookies_plain.txt"
+
+def get_app_data_dir():
+    if sys.platform.startswith('win'):
+        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~/AppData/Local')
+    elif sys.platform == 'darwin':
+        base = os.path.expanduser('~/Library/Application Support')
+    else:
+        base = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
+    path = os.path.join(base, 'OCRemixJukebox')
+    os.makedirs(path, exist_ok=True)
+    return path
+
+app_data_dir = get_app_data_dir()
+encrypted_cookies_file = os.path.join(app_data_dir, "soundcloud_cookies.enc")
+plain_cookies_file = os.path.join(app_data_dir, "soundcloud_cookies_plain.txt")
 temp_cookies_file = None
+
+def migrate_legacy_file(filename, destination):
+    if not os.path.exists(destination) and os.path.isfile(filename):
+        try:
+            shutil.copy2(filename, destination)
+        except OSError:
+            pass
+
+migrate_legacy_file("soundcloud_cookies.enc", encrypted_cookies_file)
+migrate_legacy_file("soundcloud_cookies_plain.txt", plain_cookies_file)
 
 # ---------- System theme ----------
 def is_windows_dark_mode():
@@ -28,11 +54,53 @@ def is_windows_dark_mode():
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
         value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
         return value == 0
-    except:
+    except Exception:
         return False
 
+def is_linux_dark_mode():
+    gtk_theme = os.environ.get("GTK_THEME", "").lower()
+    if "dark" in gtk_theme:
+        return True
+    try:
+        result = subprocess.run(
+            ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0 and "dark" in result.stdout.lower():
+            return True
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    try:
+        result = subprocess.run(
+            ["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0 and "dark" in result.stdout.lower():
+            return True
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    kde_globals = os.path.expanduser("~/.config/kdeglobals")
+    if os.path.isfile(kde_globals):
+        try:
+            with open(kde_globals, "r", encoding="utf-8") as file:
+                return "colortext" in file.read().lower()
+        except OSError:
+            pass
+    return False
+
+def is_dark_mode():
+    if sys.platform.startswith("win"):
+        return is_windows_dark_mode()
+    if sys.platform.startswith("linux"):
+        return is_linux_dark_mode()
+    return False
+
 def apply_system_theme(app):
-    if is_windows_dark_mode():
+    if is_dark_mode():
         app.setStyle(QStyleFactory.create("Fusion"))
         dark = QPalette()
         dark.setColor(QPalette.Window, QColor(53,53,53))
@@ -55,9 +123,24 @@ def apply_system_theme(app):
 
 # ---------- Cookie encryption ----------
 def get_machine_key():
+    if sys.platform.startswith("linux"):
+        for machine_id_path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+            try:
+                with open(machine_id_path, "rb") as f:
+                    machine_id = f.read().strip()
+                if machine_id:
+                    kdf = PBKDF2HMAC(
+                        algorithm=hashes.SHA256(),
+                        length=32,
+                        salt=b"ocremix_salt_2025",
+                        iterations=100000,
+                    )
+                    return base64.urlsafe_b64encode(kdf.derive(machine_id))
+            except OSError:
+                pass
     mac = uuid.getnode()
     if mac in (0xffffffffffff, 0):
-        key_file = "machine_key.bin"
+        key_file = os.path.join(app_data_dir, "machine_key.bin")
         if os.path.exists(key_file):
             with open(key_file, "rb") as f:
                 return f.read()
@@ -113,7 +196,8 @@ def load_plain_cookies():
 # ---------- Audio player ----------
 class AudioPlayer:
     def __init__(self):
-        self.instance = vlc.Instance('--quiet', '--no-xlib', '--log-verbose=0', '--verbose=-1')
+        vlc_args = ['--quiet', '--log-verbose=0', '--verbose=-1']
+        self.instance = vlc.Instance(*vlc_args)
         self.player = self.instance.media_player_new()
         self.current_url = None
         self.length = 0
@@ -169,7 +253,7 @@ def get_ydl_options():
         'socket_timeout': 5,
         'retries': 5,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
             'Referer': 'https://soundcloud.com/',
         }
     }
@@ -387,7 +471,8 @@ class OCRemixWindow(QMainWindow):
         self.resize(1100, 700)
         self.game_catalog = {}
         self.filtered_game_ids = []
-        self.cache_file = "games_cache.json"
+        self.cache_file = os.path.join(app_data_dir, "games_cache.json")
+        migrate_legacy_file("games_cache.json", self.cache_file)
         self.added_games = {}
         self.tracks_by_game = {}
         self.master_tracklist = []
@@ -1469,6 +1554,8 @@ class OCRemixWindow(QMainWindow):
 
     def setup_media_keys(self):
         try:
+            if pynput_keyboard is None:
+                raise RuntimeError("pynput is unavailable (no supported keyboard backend)")
             self.listener = pynput_keyboard.Listener(on_press=self.on_key_press)
             self.listener.daemon = True
             self.listener.start()
@@ -1478,6 +1565,14 @@ class OCRemixWindow(QMainWindow):
 
     def on_key_press(self, key):
         try:
+            key_name = getattr(key, 'name', '')
+            if key_name in ('media_play_pause', 'play_pause'):
+                self.signals.media_play_pause.emit()
+            elif key_name in ('media_previous', 'previous'):
+                self.signals.media_previous.emit()
+            elif key_name in ('media_next', 'next'):
+                self.signals.media_next.emit()
+                return
             if hasattr(key, 'vk') and key.vk:
                 if key.vk == 0xB3:
                     self.signals.media_play_pause.emit()
